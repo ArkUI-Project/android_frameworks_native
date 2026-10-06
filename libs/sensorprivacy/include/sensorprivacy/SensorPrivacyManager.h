@@ -18,6 +18,7 @@
 #define ANDROID_SENSOR_PRIVACY_MANAGER_H
 
 #include "android/hardware/ISensorPrivacyListener.h"
+#include "android/hardware/IMotionSensorPrivacyListener.h"
 #include "android/hardware/ISensorPrivacyManager.h"
 
 #include <utils/threads.h>
@@ -62,6 +63,11 @@ public:
     int getToggleSensorPrivacyState(int toggleType, int sensor);
     std::vector<String16> getCameraPrivacyAllowlist();
     bool isCameraPrivacyEnabled(String16 packageName);
+    status_t addMotionSensorPrivacyListener(
+            const sp<hardware::IMotionSensorPrivacyListener>& listener);
+    void removeMotionSensorPrivacyListener(
+            const sp<hardware::IMotionSensorPrivacyListener>& listener);
+    status_t getMotionSensorBlockedUntil(uid_t uid, int64_t* blockedUntil);
 
     status_t linkToDeath(const sp<IBinder::DeathRecipient>& recipient);
     status_t unlinkToDeath(const sp<IBinder::DeathRecipient>& recipient);

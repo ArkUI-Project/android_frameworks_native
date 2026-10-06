@@ -47,6 +47,7 @@
 #include "RecentEventLogger.h"
 #include "SensorList.h"
 #include "android/hardware/BnSensorPrivacyListener.h"
+#include "android/hardware/BnMotionSensorPrivacyListener.h"
 
 #if __clang__
 // Clang warns about SensorEventConnection::dump hiding BBinder::dump. The cause isn't fixable
@@ -381,6 +382,39 @@ private:
                                                   bool enabled);
     };
 
+    class MotionSensorPrivacyPolicy : public hardware::BnMotionSensorPrivacyListener {
+    public:
+        explicit MotionSensorPrivacyPolicy(wp<SensorService> service) : mService(service) {}
+        void registerSelf();
+        void unregisterSelf();
+        void initializeUid(uid_t uid);
+        int64_t getBlockedUntil(uid_t uid);
+        binder::Status onMotionSensorPrivacyChanged(int32_t uid, int64_t blockedUntil) override;
+        static uid_t appUid(uid_t uid);
+    private:
+        class AccessChangeHandler : public MessageHandler {
+        public:
+            AccessChangeHandler(wp<SensorService> service, uid_t uid)
+                : mService(service), mUid(uid) {}
+            void handleMessage(const Message&) override;
+        private:
+            wp<SensorService> mService;
+            uid_t mUid;
+        };
+        wp<SensorService> mService;
+        Mutex mPolicyLock;
+        std::unordered_map<uid_t, int64_t> mBlockedUntil;
+        std::unordered_map<uid_t, uint64_t> mGenerations;
+        std::unordered_map<uid_t, sp<AccessChangeHandler>> mHandlers;
+        void updateLocked(uid_t uid, int64_t until, const sp<SensorService>& service);
+    };
+
+    int64_t getMotionSensorBlockedUntil(uid_t uid);
+    bool hasMotionSensorAccess(uid_t uid);
+    static bool isMotionSensor(int type);
+    static bool isMotionEventAllowed(const sensors_event_t& event, int64_t until, int64_t now);
+    void onMotionSensorAccessChanged(uid_t uid);
+
     // A class automatically clearing and restoring binder caller identity inside
     // a code block (scoped variable).
     // Declare one systematically before calling SensorPrivacyManager methods so that they are
@@ -603,6 +637,7 @@ private:
 
     sp<UidPolicy> mUidPolicy;
     sp<SensorPrivacyPolicy> mSensorPrivacyPolicy;
+    sp<MotionSensorPrivacyPolicy> mMotionSensorPrivacyPolicy;
 
     static AppOpsManager sAppOpsManager;
     static std::map<String16, int> sPackageTargetVersion;

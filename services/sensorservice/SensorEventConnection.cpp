@@ -17,6 +17,7 @@
 #include <log/log.h>
 #include <sys/socket.h>
 #include <utils/threads.h>
+#include <utils/SystemClock.h>
 
 #include <android/util/ProtoOutputStream.h>
 #include <frameworks/base/core/proto/android/service/sensor_service.proto.h>
@@ -26,6 +27,7 @@
 #include "BatteryService.h"
 #include "SensorEventConnection.h"
 #include "SensorDevice.h"
+#include "SensorInterface.h"
 
 #define UNUSED(x) (void)(x)
 
@@ -371,6 +373,31 @@ status_t SensorService::SensorEventConnection::sendEvents(
         }
     }
 
+    const int64_t motionBlockedUntil = mService->getMotionSensorBlockedUntil(mUid);
+    if (motionBlockedUntil != 0 && count != 0) {
+        const int64_t now = elapsedRealtimeNano();
+        // buffer is shared between clients. Never sanitize another client's input in place.
+        if (scratch == buffer) {
+            sanitizedBuffer.reset(new sensors_event_t[count]);
+            scratch = sanitizedBuffer.get();
+            int kept = 0;
+            for (int i = 0; i < count; i++) {
+                if (isMotionEventAllowed(buffer[i], motionBlockedUntil, now)) {
+                    scratch[kept++] = buffer[i];
+                }
+            }
+            count = kept;
+        } else {
+            int kept = 0;
+            for (int i = 0; i < count; i++) {
+                if (isMotionEventAllowed(scratch[i], motionBlockedUntil, now)) {
+                    scratch[kept++] = scratch[i];
+                }
+            }
+            count = kept;
+        }
+    }
+
     sendPendingFlushEventsLocked();
     // Early return if there are no events for this connection.
     if (count == 0) {
@@ -442,6 +469,17 @@ status_t SensorService::SensorEventConnection::sendEvents(
 bool SensorService::SensorEventConnection::hasSensorAccess() {
     return mService->isUidActive(mUid)
         && !mService->mSensorPrivacyPolicy->isSensorPrivacyEnabled();
+}
+
+bool SensorService::SensorEventConnection::isMotionEventAllowed(
+        const sensors_event_t& event, int64_t until, int64_t now) {
+    if (until != 0 && event.type == SENSOR_TYPE_ADDITIONAL_INFO) {
+        const auto sensor = mService->getSensorInterfaceFromHandle(event.sensor);
+        if (sensor != nullptr && SensorService::isMotionSensor(sensor->getSensor().getType())) {
+            return now >= until && event.timestamp >= until;
+        }
+    }
+    return SensorService::isMotionEventAllowed(event, until, now);
 }
 
 bool SensorService::SensorEventConnection::noteOpIfRequired(const sensors_event_t& event) {
@@ -590,6 +628,15 @@ void SensorService::SensorEventConnection::writeToSocketFromCache() {
             int(mService->mSocketBufferSize/(sizeof(sensors_event_t)*2)));
     Mutex::Autolock _l(mConnectionLock);
     // Send pending flush complete events (if any)
+    const int64_t until = mService->getMotionSensorBlockedUntil(mUid);
+    const int64_t now = elapsedRealtimeNano();
+    int kept = 0;
+    for (int i = 0; i < mCacheSize; i++) {
+        if (isMotionEventAllowed(mEventCache[i], until, now)) {
+            mEventCache[kept++] = mEventCache[i];
+        }
+    }
+    mCacheSize = kept;
     sendPendingFlushEventsLocked();
     for (int numEventsSent = 0; numEventsSent < mCacheSize;) {
         const int numEventsToWrite = helpers::min(mCacheSize - numEventsSent, maxWriteSize);

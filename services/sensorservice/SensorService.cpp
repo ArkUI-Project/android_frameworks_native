@@ -34,6 +34,7 @@
 #include <inttypes.h>
 #include <log/log.h>
 #include <math.h>
+#include <limits>
 #include <openssl/digest.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -165,6 +166,7 @@ SensorService::SensorService()
       mWakeLockAcquired(false), mLastReportedProxIsActive(false) {
     mUidPolicy = new UidPolicy(this);
     mSensorPrivacyPolicy = new SensorPrivacyPolicy(this);
+    mMotionSensorPrivacyPolicy = new MotionSensorPrivacyPolicy(this);
     mMicSensorPrivacyPolicy = new MicrophonePrivacyPolicy(this);
 }
 
@@ -498,6 +500,7 @@ void SensorService::onFirstRef() {
 
             // Start watching sensor privacy changes
             mSensorPrivacyPolicy->registerSelf();
+            mMotionSensorPrivacyPolicy->registerSelf();
 
             // Start watching mic sensor privacy changes
             mMicSensorPrivacyPolicy->registerSelf();
@@ -573,6 +576,7 @@ SensorService::~SensorService() {
     }
     mUidPolicy->unregisterSelf();
     mSensorPrivacyPolicy->unregisterSelf();
+    mMotionSensorPrivacyPolicy->unregisterSelf();
     mMicSensorPrivacyPolicy->unregisterSelf();
 }
 
@@ -1591,6 +1595,8 @@ sp<ISensorEventConnection> SensorService::createSensorEventConnection(const Stri
     }
     resetTargetSdkVersionCache(opPackageName);
 
+    // Initialize using the Binder UID, never an app-supplied package identity.
+    mMotionSensorPrivacyPolicy->initializeUid(IPCThreadState::self()->getCallingUid());
     Mutex::Autolock _l(mLock);
     // To create a client in DATA_INJECTION mode to inject data, SensorService should already be
     // operating in DI mode.
@@ -1653,6 +1659,7 @@ sp<ISensorEventConnection> SensorService::createSensorDirectConnection(
         const String16& opPackageName, int deviceId, uint32_t size, int32_t type, int32_t format,
         const native_handle *resource) {
     resetTargetSdkVersionCache(opPackageName);
+    mMotionSensorPrivacyPolicy->initializeUid(IPCThreadState::self()->getCallingUid());
     ConnectionSafeAutolock connLock = mConnectionHolder.lock(mLock);
 
     // No new direct connections are allowed when sensor privacy is enabled
@@ -2715,6 +2722,150 @@ status_t SensorService::adjustRateLevelBasedOnMicAndPermission(int* requestedRat
         return OK;
     }
     return OK;
+}
+
+uid_t SensorService::MotionSensorPrivacyPolicy::appUid(uid_t uid) {
+    const uid_t appId = multiuser_get_app_id(uid);
+    return appId >= AID_SDK_SANDBOX_PROCESS_START && appId <= AID_SDK_SANDBOX_PROCESS_END
+            ? multiuser_get_uid(multiuser_get_user_id(uid),
+                    appId - AID_SDK_SANDBOX_PROCESS_START + FIRST_APPLICATION_UID) : uid;
+}
+
+void SensorService::MotionSensorPrivacyPolicy::registerSelf() {
+    AutoCallerClear acc;
+    SensorPrivacyManager spm;
+    const status_t status = spm.addMotionSensorPrivacyListener(this);
+    ALOGE_IF(status != OK, "Cannot observe device motion privacy: %d", status);
+}
+
+void SensorService::MotionSensorPrivacyPolicy::unregisterSelf() {
+    AutoCallerClear acc;
+    SensorPrivacyManager spm;
+    spm.removeMotionSensorPrivacyListener(this);
+}
+
+void SensorService::MotionSensorPrivacyPolicy::initializeUid(uid_t uid) {
+    uid = appUid(uid);
+    if (multiuser_get_app_id(uid) < FIRST_APPLICATION_UID) return;
+    sp<SensorService> service = mService.promote();
+    if (service == nullptr) return;
+    uint64_t generation;
+    {
+        Mutex::Autolock lock(mPolicyLock);
+        generation = mGenerations[uid];
+    }
+    AutoCallerClear acc;
+    SensorPrivacyManager spm;
+    int64_t until = 0;
+    const status_t status = spm.getMotionSensorBlockedUntil(uid, &until);
+    if (status != OK) {
+        // A failed policy lookup must not grant a new application unrestricted sensor access.
+        until = std::numeric_limits<int64_t>::max();
+        ALOGE("Cannot load device motion privacy for uid %u: %d", uid, status);
+    }
+    Mutex::Autolock lock(mPolicyLock);
+    // A mode change arriving during the query takes precedence over its older result.
+    if (mGenerations[uid] == generation) updateLocked(uid, until, service);
+}
+
+int64_t SensorService::MotionSensorPrivacyPolicy::getBlockedUntil(uid_t uid) {
+    uid = appUid(uid);
+    const uid_t appId = multiuser_get_app_id(uid);
+    if (appId < FIRST_APPLICATION_UID) return 0;
+    // Isolated processes have no independently grantable sensor identity. Their app must broker
+    // motion through its own UID, so a passed SensorServer Binder cannot bypass the app's choice.
+    if (appId >= AID_ISOLATED_START && appId <= AID_ISOLATED_END) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    Mutex::Autolock lock(mPolicyLock);
+    const auto entry = mBlockedUntil.find(uid);
+    return entry == mBlockedUntil.end() ? 0 : entry->second;
+}
+
+binder::Status SensorService::MotionSensorPrivacyPolicy::onMotionSensorPrivacyChanged(
+        int32_t uid, int64_t until) {
+    sp<SensorService> service = mService.promote();
+    if (service == nullptr) return binder::Status::ok();
+    Mutex::Autolock lock(mPolicyLock);
+    updateLocked(uid, until, service);
+    return binder::Status::ok();
+}
+
+void SensorService::MotionSensorPrivacyPolicy::updateLocked(
+        uid_t uid, int64_t until, const sp<SensorService>& service) {
+    ++mGenerations[uid];
+    mBlockedUntil[uid] = until;
+    sp<AccessChangeHandler>& handler = mHandlers[uid];
+    if (handler == nullptr) handler = new AccessChangeHandler(mService, uid);
+    service->mLooper->removeMessages(handler);
+    service->mLooper->sendMessage(handler, Message(0));
+    const int64_t now = elapsedRealtimeNano();
+    if (until > now && until != std::numeric_limits<int64_t>::max()) {
+        service->mLooper->sendMessageDelayed(until - now, handler, Message(0));
+    }
+}
+
+void SensorService::MotionSensorPrivacyPolicy::AccessChangeHandler::handleMessage(const Message&) {
+    sp<SensorService> service = mService.promote();
+    if (service != nullptr) service->onMotionSensorAccessChanged(mUid);
+}
+
+int64_t SensorService::getMotionSensorBlockedUntil(uid_t uid) {
+    return mMotionSensorPrivacyPolicy->getBlockedUntil(uid);
+}
+
+bool SensorService::hasMotionSensorAccess(uid_t uid) {
+    return elapsedRealtimeNano() >= getMotionSensorBlockedUntil(uid);
+}
+
+bool SensorService::isMotionSensor(int type) {
+    switch (type) {
+        case SENSOR_TYPE_ACCELEROMETER:
+        case SENSOR_TYPE_MAGNETIC_FIELD:
+        case SENSOR_TYPE_ORIENTATION:
+        case SENSOR_TYPE_GYROSCOPE:
+        case SENSOR_TYPE_GRAVITY:
+        case SENSOR_TYPE_LINEAR_ACCELERATION:
+        case SENSOR_TYPE_ROTATION_VECTOR:
+        case SENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED:
+        case SENSOR_TYPE_GAME_ROTATION_VECTOR:
+        case SENSOR_TYPE_GYROSCOPE_UNCALIBRATED:
+        case SENSOR_TYPE_SIGNIFICANT_MOTION:
+        case SENSOR_TYPE_GEOMAGNETIC_ROTATION_VECTOR:
+        case SENSOR_TYPE_TILT_DETECTOR:
+        case SENSOR_TYPE_WAKE_GESTURE:
+        case SENSOR_TYPE_GLANCE_GESTURE:
+        case SENSOR_TYPE_PICK_UP_GESTURE:
+        case SENSOR_TYPE_POSE_6DOF:
+        case SENSOR_TYPE_ACCELEROMETER_UNCALIBRATED:
+        case SENSOR_TYPE_ACCELEROMETER_LIMITED_AXES:
+        case SENSOR_TYPE_GYROSCOPE_LIMITED_AXES:
+        case SENSOR_TYPE_ACCELEROMETER_LIMITED_AXES_UNCALIBRATED:
+        case SENSOR_TYPE_GYROSCOPE_LIMITED_AXES_UNCALIBRATED:
+        case SENSOR_TYPE_HEADING:
+        case SENSOR_TYPE_DEVICE_ORIENTATION:
+        case SENSOR_TYPE_STATIONARY_DETECT:
+        case SENSOR_TYPE_MOTION_DETECT:
+        case SENSOR_TYPE_HEAD_TRACKER:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool SensorService::isMotionEventAllowed(const sensors_event_t& event, int64_t until, int64_t now) {
+    // Retain the deadline after it expires: batched/cached opening events cannot be replayed later.
+    return !isMotionSensor(event.type) || until == 0
+            || (now >= until && event.timestamp >= until);
+}
+
+void SensorService::onMotionSensorAccessChanged(uid_t uid) {
+    ConnectionSafeAutolock connLock = mConnectionHolder.lock(mLock);
+    for (const sp<SensorDirectConnection>& connection : connLock.getDirectConnections()) {
+        if (MotionSensorPrivacyPolicy::appUid(connection->getUid()) == uid) {
+            connection->onMotionSensorAccessChanged();
+        }
+    }
 }
 
 void SensorService::SensorPrivacyPolicy::registerSelf() {

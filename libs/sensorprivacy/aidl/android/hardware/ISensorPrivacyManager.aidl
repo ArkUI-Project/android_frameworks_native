@@ -17,6 +17,7 @@
 package android.hardware;
 
 import android.hardware.ISensorPrivacyListener;
+import android.hardware.IMotionSensorPrivacyListener;
 
 /** @hide */
 interface ISensorPrivacyManager {
@@ -51,5 +52,14 @@ interface ISensorPrivacyManager {
     void setToggleSensorPrivacyStateForProfileGroup(int userId, int source, int sensor, int  state);
 
     boolean isCameraPrivacyEnabled(String packageName);
+
+    // Keep transaction order identical to frameworks/base/core/java/android/hardware.
+    void setCameraPrivacyAllowlist(in List<String> allowlist);
+
+    void addMotionSensorPrivacyListener(in IMotionSensorPrivacyListener listener);
+
+    void removeMotionSensorPrivacyListener(in IMotionSensorPrivacyListener listener);
+
+    long getMotionSensorBlockedUntil(int uid);
 
 }

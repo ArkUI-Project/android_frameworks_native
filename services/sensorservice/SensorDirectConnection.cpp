@@ -131,6 +131,26 @@ void SensorService::SensorDirectConnection::onMicSensorAccessChanged(bool isMicT
     }
 }
 
+void SensorService::SensorDirectConnection::onMotionSensorAccessChanged() {
+    if (mService->hasMotionSensorAccess(mUid)) {
+        // This callback runs with SensorService's connection lock already held.
+        if (mService->hasSensorAccessLocked(mUid, mOpPackageName)) recoverAll();
+        return;
+    }
+    Mutex::Autolock lock(mConnectionLock);
+    const sensors_direct_cfg_t stopConfig = {.rate_level = SENSOR_DIRECT_RATE_STOP};
+    for (auto it = mActivated.begin(); it != mActivated.end();) {
+        const auto sensor = mService->getSensorInterfaceFromHandle(it->first);
+        if (sensor != nullptr && SensorService::isMotionSensor(sensor->getSensor().getType())) {
+            configure(it->first, &stopConfig);
+            mActivatedBackup[it->first] = it->second;
+            it = mActivated.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 bool SensorService::SensorDirectConnection::hasSensorAccess() const {
     return mService->hasSensorAccess(mUid, mOpPackageName);
 }
@@ -164,11 +184,13 @@ int32_t SensorService::SensorDirectConnection::configureChannel(int handle, int 
 
     if (handle == -1 && rateLevel == SENSOR_DIRECT_RATE_STOP) {
         stopAll();
+        Mutex::Autolock lock(mConnectionLock);
+        mActivatedBackup.clear();
         mMicRateBackup.clear();
         return NO_ERROR;
     }
 
-    if (!hasSensorAccess()) {
+    if (rateLevel != SENSOR_DIRECT_RATE_STOP && !hasSensorAccess()) {
         return PERMISSION_DENIED;
     }
 
@@ -178,6 +200,10 @@ int32_t SensorService::SensorDirectConnection::configureChannel(int handle, int 
     }
 
     const Sensor& s = si->getSensor();
+    if (rateLevel != SENSOR_DIRECT_RATE_STOP && SensorService::isMotionSensor(s.getType())
+            && !mService->hasMotionSensorAccess(mUid)) {
+        return PERMISSION_DENIED;
+    }
     if (!mService->canAccessSensor(s, "config direct channel", mOpPackageName)) {
         return PERMISSION_DENIED;
     }
@@ -208,6 +234,7 @@ int32_t SensorService::SensorDirectConnection::configureChannel(int handle, int 
     if (rateLevel == SENSOR_DIRECT_RATE_STOP) {
         if (ret == NO_ERROR) {
             mActivated.erase(handle);
+            mActivatedBackup.erase(handle);
             mMicRateBackup.erase(handle);
         } else if (ret > 0) {
             ret = UNKNOWN_ERROR;
@@ -241,40 +268,29 @@ void SensorService::SensorDirectConnection::capRates() {
         .rate_level = SENSOR_DIRECT_RATE_STOP
     };
 
-    // If our requests are in the backup, then we shouldn't activate sensors from here
-    bool temporarilyStopped = mActivated.empty() && !mActivatedBackup.empty();
-    std::unordered_map<int, int>& existingConnections =
-                    (!temporarilyStopped) ? mActivated : mActivatedBackup;
-
-    for (auto &i : existingConnections) {
-        int handle = i.first;
-        int rateLevel = i.second;
-        std::shared_ptr<SensorInterface> si = mService->getSensorInterfaceFromHandle(handle);
-        if (si != nullptr) {
-            const Sensor& s = si->getSensor();
-            if (mService->isSensorInCappedSet(s.getType()) &&
-                        rateLevel > SENSOR_SERVICE_CAPPED_SAMPLING_RATE_LEVEL) {
+    // Motion privacy can stop a subset of a channel's sensors. Update both sets of rates.
+    const auto cap = [&](std::unordered_map<int, int>& connections, bool active) {
+        for (auto &i : connections) {
+            const int handle = i.first;
+            const int rateLevel = i.second;
+            const auto si = mService->getSensorInterfaceFromHandle(handle);
+            if (si != nullptr && mService->isSensorInCappedSet(si->getSensor().getType())
+                    && rateLevel > SENSOR_SERVICE_CAPPED_SAMPLING_RATE_LEVEL) {
                 mMicRateBackup[handle] = rateLevel;
-                // Modify the rate kept by the existing map
-                existingConnections[handle] = SENSOR_SERVICE_CAPPED_SAMPLING_RATE_LEVEL;
-                // Only reconfigure the channel if it's ongoing
-                if (!temporarilyStopped) {
-                    // Stopping before reconfiguring is the well-tested path in CTS
+                i.second = SENSOR_SERVICE_CAPPED_SAMPLING_RATE_LEVEL;
+                if (active) {
                     configure(handle, &stopConfig);
                     configure(handle, &capConfig);
                 }
             }
         }
-    }
+    };
+    cap(mActivated, true);
+    cap(mActivatedBackup, false);
 }
 
 void SensorService::SensorDirectConnection::uncapRates() {
     Mutex::Autolock _l(mConnectionLock);
-
-    // If our requests are in the backup, then we shouldn't activate sensors from here
-    bool temporarilyStopped = mActivated.empty() && !mActivatedBackup.empty();
-    std::unordered_map<int, int>& existingConnections =
-                    (!temporarilyStopped) ? mActivated : mActivatedBackup;
 
     const struct sensors_direct_cfg_t stopConfig = {
         .rate_level = SENSOR_DIRECT_RATE_STOP
@@ -288,10 +304,14 @@ void SensorService::SensorDirectConnection::uncapRates() {
         };
 
         // Modify the rate kept by the existing map
-        existingConnections[handle] = rateLevel;
+        const auto active = mActivated.find(handle);
+        const auto stopped = mActivatedBackup.find(handle);
+        if (active != mActivated.end()) active->second = rateLevel;
+        else if (stopped != mActivatedBackup.end()) stopped->second = rateLevel;
+        else continue;
 
         // Only reconfigure the channel if it's ongoing
-        if (!temporarilyStopped) {
+        if (active != mActivated.end()) {
             // Stopping before reconfiguring is the well-tested path in CTS
             configure(handle, &stopConfig);
             configure(handle, &config);
@@ -324,29 +344,27 @@ void SensorService::SensorDirectConnection::stopAllLocked(bool backupRecord) {
         configure(i.first, &config);
     }
 
-    if (backupRecord && mActivatedBackup.empty()) {
-        mActivatedBackup = mActivated;
+    if (backupRecord) {
+        mActivatedBackup.insert(mActivated.begin(), mActivated.end());
     }
     mActivated.clear();
 }
 
 void SensorService::SensorDirectConnection::recoverAll() {
     Mutex::Autolock _l(mConnectionLock);
-    if (!mActivatedBackup.empty()) {
-        stopAllLocked(false);
-
-        // recover list of report from backup
-        ALOG_ASSERT(mActivated.empty(),
-                    "mActivated must be empty if mActivatedBackup was non-empty");
-        mActivated = mActivatedBackup;
-        mActivatedBackup.clear();
-
-        // re-enable them
-        for (auto &i : mActivated) {
-            struct sensors_direct_cfg_t config = {
-                .rate_level = i.second
-            };
-            configure(i.first, &config);
+    for (auto it = mActivatedBackup.begin(); it != mActivatedBackup.end();) {
+        const auto sensor = mService->getSensorInterfaceFromHandle(it->first);
+        if (sensor != nullptr && SensorService::isMotionSensor(sensor->getSensor().getType())
+                && !mService->hasMotionSensorAccess(mUid)) {
+            ++it;
+            continue;
+        }
+        const sensors_direct_cfg_t config = {.rate_level = it->second};
+        if (configure(it->first, &config) > 0) {
+            mActivated[it->first] = it->second;
+            it = mActivatedBackup.erase(it);
+        } else {
+            ++it;
         }
     }
 }

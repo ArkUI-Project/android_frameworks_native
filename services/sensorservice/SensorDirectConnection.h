@@ -53,6 +53,7 @@ public:
     // app changed to idle/active status.
     void onSensorAccessChanged(bool hasAccess);
     void onMicSensorAccessChanged(bool isMicToggleOn);
+    void onMotionSensorAccessChanged();
     userid_t getUserId() const { return mUserId; }
     int getDeviceId() const { return mDeviceId; }
 

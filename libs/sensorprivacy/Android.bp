@@ -58,6 +58,7 @@ filegroup {
     name: "libsensorprivacy_aidl",
     srcs: [
         "aidl/android/hardware/ISensorPrivacyListener.aidl",
+        "aidl/android/hardware/IMotionSensorPrivacyListener.aidl",
         "aidl/android/hardware/ISensorPrivacyManager.aidl",
     ],
     path: "aidl",

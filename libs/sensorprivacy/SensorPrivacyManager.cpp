@@ -65,6 +65,29 @@ void SensorPrivacyManager::addSensorPrivacyListener(
     }
 }
 
+status_t SensorPrivacyManager::addMotionSensorPrivacyListener(
+        const sp<hardware::IMotionSensorPrivacyListener>& listener) {
+    sp<hardware::ISensorPrivacyManager> service = getService();
+    if (service == nullptr) return UNEXPECTED_NULL;
+    const binder::Status status = service->addMotionSensorPrivacyListener(listener);
+    return status.isOk() ? OK : (status.transactionError() != OK
+            ? status.transactionError() : PERMISSION_DENIED);
+}
+
+void SensorPrivacyManager::removeMotionSensorPrivacyListener(
+        const sp<hardware::IMotionSensorPrivacyListener>& listener) {
+    sp<hardware::ISensorPrivacyManager> service = getService();
+    if (service != nullptr) service->removeMotionSensorPrivacyListener(listener);
+}
+
+status_t SensorPrivacyManager::getMotionSensorBlockedUntil(uid_t uid, int64_t* blockedUntil) {
+    sp<hardware::ISensorPrivacyManager> service = getService();
+    if (service == nullptr) return UNEXPECTED_NULL;
+    const binder::Status status = service->getMotionSensorBlockedUntil(uid, blockedUntil);
+    return status.isOk() ? OK : (status.transactionError() != OK
+            ? status.transactionError() : PERMISSION_DENIED);
+}
+
 status_t SensorPrivacyManager::addToggleSensorPrivacyListener(
         const sp<hardware::ISensorPrivacyListener>& listener)
 {

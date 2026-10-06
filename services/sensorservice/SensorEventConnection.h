@@ -139,6 +139,7 @@ private:
     // Returns whether sensor access is available based on both the uid being active and sensor
     // privacy not being enabled.
     bool hasSensorAccess();
+    bool isMotionEventAllowed(const sensors_event_t& event, int64_t until, int64_t now);
 
     // Call noteOp for the sensor if the sensor requires a permission
     bool noteOpIfRequired(const sensors_event_t& event);
