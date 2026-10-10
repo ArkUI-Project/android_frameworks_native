@@ -1631,6 +1631,65 @@ TEST_P(RenderEngineTest, drawLayers_fillSmallLayerAndBlurBackground_colorSource)
     fillSmallLayerAndBlurBackground<ColorSourceVariant>();
 }
 
+TEST_P(RenderEngineTest, drawLayers_progressiveBlur_isContinuousAndClipped) {
+    if (!GetParam()->apiSupported()) GTEST_SKIP();
+    initializeRenderEngine();
+    if (!mRE->supportsBackgroundBlur()) GTEST_SKIP();
+
+    renderengine::DisplaySettings settings;
+    settings.outputDataspace = ui::Dataspace::V0_SRGB_LINEAR;
+    settings.physicalDisplay = fullscreenRect();
+    settings.clip = fullscreenRect();
+
+    renderengine::LayerSettings background;
+    background.sourceDataspace = ui::Dataspace::V0_SRGB_LINEAR;
+    background.geometry.boundaries = fullscreenRect().toFloatRect();
+    ColorSourceVariant::fillColor(background, 0.f, 1.f, 0.f, this);
+    background.alpha = 1.f;
+    auto left = background;
+    left.geometry.boundaries = Rect(64, DEFAULT_DISPLAY_HEIGHT).toFloatRect();
+    ColorSourceVariant::fillColor(left, 1.f, 0.f, 0.f, this);
+
+    auto blur = background;
+    blur.alpha = 0.f;
+    blur.blurRegions.push_back(BlurRegion{.blurRadius = 32u | BlurRegion::kProgressive,
+                                          .cornerRadiusTL = 0.f, .cornerRadiusTR = 0.f,
+                                          .cornerRadiusBL = 0.f, .cornerRadiusBR = 0.f,
+                                          .alpha = 1.f, .left = 16, .top = 32,
+                                          .right = 112, .bottom = 224});
+    invokeDraw(settings, {background, left, blur});
+    expectBufferColor(Point(60, 31), 255, 0, 0, 255);
+    expectBufferColor(Point(60, 224), 255, 0, 0, 255);
+    expectBufferColor(Point(60, 40), 255, 0, 0, 255, 1);
+
+    uint8_t* pixels;
+    ASSERT_EQ(NO_ERROR, mBuffer->getBuffer()->lock(GRALLOC_USAGE_SW_READ_OFTEN,
+                                                   reinterpret_cast<void**>(&pixels)));
+    auto red = [&](int y) { return pixels[(mBuffer->getBuffer()->getStride() * y + 60) * 4]; };
+    EXPECT_LT(red(220), 185);
+    EXPECT_GT(red(220), 128);
+    // Check every row, not just the endpoints: a stepped set of blur rectangles fails here.
+    for (int y = 41; y <= 220; y++) {
+        EXPECT_LE(std::abs(int(red(y)) - int(red(y - 1))), 4) << "row=" << y;
+        EXPECT_LE(int(red(y)), int(red(y - 1)) + 1) << "row=" << y;
+    }
+    mBuffer->getBuffer()->unlock();
+
+    // Fine stripes must lose contrast at the blurred end, without periodic sampling echoes.
+    std::vector<renderengine::LayerSettings> stripes;
+    for (int x = 0; x < DEFAULT_DISPLAY_WIDTH; x += 2) {
+        auto stripe = background;
+        stripe.geometry.boundaries = Rect(x, 0, x + 2, DEFAULT_DISPLAY_HEIGHT).toFloatRect();
+        const float value = (x / 2) % 2;
+        ColorSourceVariant::fillColor(stripe, value, value, value, this);
+        stripes.push_back(stripe);
+    }
+    stripes.push_back(blur);
+    invokeDraw(settings, stripes);
+    expectBufferColor(Point(60, 40), 0, 0, 0, 255, 1);
+    expectBufferColor(Rect(48, 210, 80, 224), 128, 128, 128, 255, 5);
+}
+
 TEST_P(RenderEngineTest, drawLayers_overlayCorners_colorSource) {
     if (!GetParam()->apiSupported()) {
         GTEST_SKIP();

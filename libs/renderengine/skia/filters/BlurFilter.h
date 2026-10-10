@@ -62,6 +62,10 @@ public:
 
     float getMaxCrossFadeRadius() const;
 
+    void drawProgressiveBlur(SkiaGpuContext* context, SkCanvas* canvas,
+                             const SkRRect& effectRegion, uint32_t radius, float alpha,
+                             const sk_sp<SkImage>& input);
+
 private:
     // To avoid downscaling artifacts, we interpolate the blurred fbo with the full composited
     // image, up to this radius.
@@ -69,6 +73,8 @@ private:
 
     // Optional blend used for crossfade only if mMaxCrossFadeRadius > 0
     const sk_sp<SkRuntimeEffect> mMixEffect;
+    const sk_sp<SkRuntimeEffect> mProgressiveEffect;
+    const sk_sp<SkRuntimeEffect> mProgressiveCompositeEffect;
 };
 
 } // namespace skia

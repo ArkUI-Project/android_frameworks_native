@@ -25,6 +25,9 @@
 namespace android {
 
 struct BlurRegion {
+    // Pack the effect kind into the existing wire value so transaction/tracing and vendor
+    // clients retain the same BlurRegion layout. Ordinary blur radii never use this bit.
+    static constexpr uint32_t kProgressive = 1u << 31;
     uint32_t blurRadius;
     float cornerRadiusTL;
     float cornerRadiusTR;
@@ -35,6 +38,9 @@ struct BlurRegion {
     int top;
     int right;
     int bottom;
+
+    uint32_t radius() const { return blurRadius & ~kProgressive; }
+    bool isProgressive() const { return (blurRadius & kProgressive) != 0; }
 
     inline bool operator==(const BlurRegion& other) const {
         return blurRadius == other.blurRadius && cornerRadiusTL == other.cornerRadiusTL &&

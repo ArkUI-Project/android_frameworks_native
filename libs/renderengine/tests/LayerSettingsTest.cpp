@@ -30,4 +30,18 @@ TEST(LayerSettingsTest, whitePointNits) {
 
     ASSERT_FALSE(a == b);
 }
+
+TEST(LayerSettingsTest, progressiveBlurChangesCompositionIdentity) {
+    LayerSettings a;
+    a.blurRegions.push_back(BlurRegion{40, 0, 0, 0, 0, 1, 0, 0, 100, 200});
+    auto b = a;
+    b.blurRegions[0].blurRadius |= BlurRegion::kProgressive;
+    EXPECT_FALSE(a == b);
+    EXPECT_NE(std::hash<BlurRegion>{}(a.blurRegions[0]),
+              std::hash<BlurRegion>{}(b.blurRegions[0]));
+    EXPECT_EQ(40u, b.blurRegions[0].radius());
+    EXPECT_TRUE(b.blurRegions[0].isProgressive());
+    EXPECT_FALSE(a.blurRegions[0].isProgressive());
+    EXPECT_EQ(40u, sizeof(BlurRegion));
+}
 } // namespace android::renderengine

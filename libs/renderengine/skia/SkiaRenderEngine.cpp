@@ -854,7 +854,7 @@ void SkiaRenderEngine::drawLayersInternal(
                 requiresCompositionLayer = true;
             }
             for (auto region : layer.blurRegions) {
-                if (region.blurRadius < mBlurFilter->getMaxCrossFadeRadius()) {
+                if (region.isProgressive() || region.radius() < mBlurFilter->getMaxCrossFadeRadius()) {
                     requiresCompositionLayer = true;
                 }
             }
@@ -978,7 +978,8 @@ void SkiaRenderEngine::drawLayersInternal(
                         requiresCrossFadeWithBlurInput = true;
                     }
                     for (auto region : layer.blurRegions) {
-                        if (region.blurRadius < mBlurFilter->getMaxCrossFadeRadius()) {
+                        if (region.isProgressive() ||
+                            region.radius() < mBlurFilter->getMaxCrossFadeRadius()) {
                             requiresCrossFadeWithBlurInput = true;
                         }
                     }
@@ -1006,6 +1007,11 @@ void SkiaRenderEngine::drawLayersInternal(
 
                 canvas->concat(getSkM44(layer.blurRegionTransform).asM33());
                 for (auto region : layer.blurRegions) {
+                    if (region.isProgressive()) {
+                        mBlurFilter->drawProgressiveBlur(context, canvas, getBlurRRect(region),
+                                                        region.radius(), region.alpha, blurInput);
+                        continue;
+                    }
                     if (cachedBlurs[region.blurRadius] == nullptr) {
                         SFTRACE_NAME("BlurRegion");
                         cachedBlurs[region.blurRadius] =
